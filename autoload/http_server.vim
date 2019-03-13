@@ -8,6 +8,7 @@ function! http_server#new(host, port, callback) abort
     let Callback = a:callback
   endif
   let obj = {
+    \ '_current_request': {},
     \ 'alive': 1,
     \ 'host': a:host,
     \ 'port': a:port,
@@ -31,11 +32,16 @@ function! http_server#new(host, port, callback) abort
     elseif (self.state == 'headers')
       " Parse a request header.
       if (empty(a:msg))
-        let self.state = 'body'
+        " In reality, this is the end of the message... Just trust the
+        " process.
+        return self._close_cb()
       else
         let header_match = matchlist(a:msg, '\([^:]\+\):\s*\([^\r\n]\+\)')
         if (empty(header_match))
-          return self._err_cb(self.channel, 'Expected request header, found "'.a:msg.'" instead.')
+          " This is not a header, consider it to be body content.
+          let self.state = 'body'
+        let self._current_request.body .= a:msg
+          "return self._err_cb(self.channel, 'Expected request header, found "'.a:msg.'" instead.')
         else
           let key = tolower(header_match[1])
           let value = header_match[2]
@@ -44,21 +50,7 @@ function! http_server#new(host, port, callback) abort
       endif
     elseif (self.state == 'body')
       if (empty(a:msg))
-        " Finalize the request
-        let channel = self.channel
-        let request = self._current_request
-        unlet self._current_request
-        let self.state = 'idle'
-
-        " Create a response object
-        let response = {'channel': channel}
-
-        function! response.write(msg) abort
-
-        endfunction
-
-        " Invoke the callback
-        return self.Callback(request, response)
+        return self._close_cb()
       else
         let self._current_request.body .= a:msg
       endif
@@ -71,14 +63,43 @@ function! http_server#new(host, port, callback) abort
     echoerr a:msg
   endfunction
 
+  function! obj._close_cb(...) abort
+    " Finalize the request
+    let old_job = self.job
+    let channel = self.channel
+    let request = self._current_request
+
+    " Reset the server, and restart it.
+    let self._current_request = {}
+    let self.state = 'idle'
+    let job = job_start('nc -l '.self.host.' '.self.port, {
+      \ 'out_cb': self._out_cb,
+      \ 'err_cb': self._err_cb,
+      \ 'close_cb': self._close_cb
+      \ })
+    let self.job = job
+    let self.channel = job_getchannel(job)
+
+    " Create a response object
+    let response = {'channel': channel, 'job': old_job}
+
+    function! response.write(msg) abort
+
+    endfunction
+
+    " Invoke the callback
+    return self.Callback(request, response)
+  endfunction
+
   function! obj.stop() abort
     call job_stop(self.job)
     let self.alive = 0
   endfunction
 
-  let job = job_start('nc -lk '.a:host.' '.a:port, {
+  let job = job_start('nc -l '.a:host.' '.a:port, {
     \ 'out_cb': obj._out_cb,
     \ 'err_cb': obj._err_cb,
+    \ 'close_cb': obj._close_cb
     \ })
   let obj.job = job
   let obj.channel = job_getchannel(job)
